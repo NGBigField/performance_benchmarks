@@ -8,9 +8,6 @@ Prints out a labeled table of results.
 Last tried with python 3.13.4 on Windows 11
 """
 
-
-
-
 import os
 import time
 import platform
@@ -20,18 +17,25 @@ import multiprocessing as mp
 import datetime
 import csv
 
-
 import numpy as np
 import psutil
 import cpuinfo
 import GPUtil
 import torch
 
+# Set random seeds for reproducibility
+RANDOM_SEED = 42
+np.random.seed(RANDOM_SEED)
+torch.manual_seed(RANDOM_SEED)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed(RANDOM_SEED)
+    torch.cuda.manual_seed_all(RANDOM_SEED)
+
 # Do we have a CUDA-capable GPU?
 HAS_CUDA = torch.cuda.is_available()
 
 # CSV output configuration
-OUTPUT_DIR = "benchmark_results"
+OUTPUT_DIR = "outputs"
 CSV_FILE = os.path.join(OUTPUT_DIR, "performance_benchmarks.csv")
 
 
@@ -74,16 +78,18 @@ def get_system_info():
     return info
 
 
-def benchmark_cpu_single(n=2000, iters=5):
+def benchmark_cpu_single(n=2000, iters=25):
     """Single‐threaded matrix‐multiply FLOPS."""
+    # Ensure reproducible random matrices
+    np.random.seed(RANDOM_SEED)
     a = np.random.rand(n, n).astype(np.float64)
     b = np.random.rand(n, n).astype(np.float64)
     # warm
     _ = a.dot(b)
-    start = time.time()
+    t0 = time.time()
     for _ in range(iters):
         a.dot(b)
-    elapsed = time.time() - start
+    elapsed = time.time() - t0
     # flops ≈ 2 * n^3 per multiply
     total_flops = 2 * (n**3) * iters
     return total_flops / elapsed / 1e9  # GFLOPS
@@ -115,16 +121,18 @@ def benchmark_gpu_single(n=4096, iters=20):
     if not HAS_CUDA:
         return None
     torch.cuda.synchronize()
+    # Ensure reproducible random tensors
+    torch.manual_seed(RANDOM_SEED)
     a = torch.randn(n, n, device='cuda', dtype=torch.float32)
     b = torch.randn(n, n, device='cuda', dtype=torch.float32)
     # warm
     _ = a @ b
     torch.cuda.synchronize()
-    start = time.time()
+    t0 = time.time()
     for _ in range(iters):
         _ = a @ b
     torch.cuda.synchronize()
-    elapsed = time.time() - start
+    elapsed = time.time() - t0
     total_flops = 2 * (n**3) * iters
     return total_flops / elapsed / 1e9  # GFLOPS
 
@@ -135,18 +143,20 @@ def benchmark_gpu_multi(n=4096, iters=10, streams=4):
         return None
     torch.cuda.synchronize()
     streams = [torch.cuda.Stream() for _ in range(streams)]
+    # Ensure reproducible random tensors
+    torch.manual_seed(RANDOM_SEED)
     a = torch.randn(n, n, device='cuda', dtype=torch.float32)
     b = torch.randn(n, n, device='cuda', dtype=torch.float32)
     # warm
     with torch.cuda.stream(streams[0]):
         _ = a @ b
     torch.cuda.synchronize()
-    start = time.time()
+    t0 = time.time()
     for s in streams:
         with torch.cuda.stream(s):
             _ = a @ b
     torch.cuda.synchronize()
-    elapsed = time.time() - start
+    elapsed = time.time() - t0
     total_flops = 2 * (n**3) * iters * len(streams)
     return total_flops / elapsed / 1e9  # GFLOPS
 
@@ -166,19 +176,21 @@ def benchmark_ram_sequential(size_mb=500):
     return size_mb / write_time, size_mb / read_time
 
 
-def benchmark_ram_random(size_mb=500, accesses=10_000_000):
+def benchmark_ram_random(size_mb=500, accesses=100_000_000):
     """Random write + read bandwidth (MB/s)."""
     size = size_mb * 1024 * 1024 // 8
     arr = np.zeros(size, dtype=np.float64)
+    # Ensure reproducible random indices
+    np.random.seed(RANDOM_SEED)
     idx = np.random.randint(0, size, size=accesses)
     # write
-    start = time.time()
+    t0 = time.time()
     arr[idx] = 3.21
-    write_time = time.time() - start
+    write_time = time.time() - t0
     # read
-    start = time.time()
+    t0 = time.time()
     tmp = arr[idx]
-    read_time = time.time() - start
+    read_time = time.time() - t0
     mb_moved = accesses * arr.itemsize / (1024*1024)
     return mb_moved / write_time, mb_moved / read_time
 
@@ -203,13 +215,55 @@ def benchmark_disk_io(file_size_mb=500):
     return file_size_mb / write_time, file_size_mb / read_time
 
 
-def write_csv_row(data: dict):
+def write_to_csv(data: dict):
     os.makedirs(OUTPUT_DIR, exist_ok=True)
-    write_header = not os.path.exists(CSV_FILE)
-    with open(CSV_FILE, 'a', newline='') as csvfile:
-        writer = csv.DictWriter(csvfile, fieldnames=list(data.keys()))
-        if write_header: writer.writeheader()
-        writer.writerow(data)
+    
+    # Create a unique identifier for this computer/run
+    computer_id = f"{data.get('hostname', 'unknown')}_{data.get('timestamp', '').replace(':', '-').replace('.', '-')}"
+    
+    # Read existing CSV if it exists
+    existing_data = {}
+    existing_order = []  # Track the order of metrics
+    
+    if os.path.exists(CSV_FILE):
+        with open(CSV_FILE, 'r', newline='') as csvfile:
+            reader = csv.DictReader(csvfile)
+            for row in reader:
+                metric = row.get('Metric', '')
+                if metric:
+                    existing_data[metric] = row
+                    existing_order.append(metric)
+    
+    # Add new data column, preserving insertion order from the data dict
+    for key, value in data.items():
+        if key not in existing_data:
+            existing_data[key] = {'Metric': key}
+            existing_order.append(key)  # Add new metrics at the end in order
+        existing_data[key][computer_id] = value
+    
+    # Write back to CSV with original insertion order
+    if existing_data:
+        # Get all computer columns (exclude 'Metric' column)
+        all_columns = set()
+        for row_data in existing_data.values():
+            all_columns.update(row_data.keys())
+        all_columns.discard('Metric')
+        
+        fieldnames = ['Metric'] + sorted(all_columns)
+        
+        with open(CSV_FILE, 'w', newline='') as csvfile:
+            writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+            writer.writeheader()
+            
+            # Write each metric as a row in the preserved order
+            for metric in existing_order:
+                if metric in existing_data:
+                    row_data = existing_data[metric]
+                    # Fill missing values with empty string
+                    complete_row = {'Metric': metric}
+                    for col in fieldnames[1:]:  # Skip 'Metric' column
+                        complete_row[col] = row_data.get(col, '')
+                    writer.writerow(complete_row)
 
 
 def report(results, key, label, value, fmt=None, skip_if_none=False, unit=None):
@@ -228,7 +282,7 @@ def report(results, key, label, value, fmt=None, skip_if_none=False, unit=None):
     
     # Add unit to the printed output if provided
     if unit:
-        print(f"{label}: {val_str} {unit}")
+        print(f"{label}: {val_str} [{unit}]")
     else:
         print(f"{label}: {val_str}")
     
@@ -236,6 +290,8 @@ def report(results, key, label, value, fmt=None, skip_if_none=False, unit=None):
 
 
 def main():
+    print("Benchmarking system performance.")
+    print("Getting system information...")
     sys = get_system_info()
     results = {}
     results['timestamp'] = datetime.datetime.now().isoformat()
@@ -244,34 +300,34 @@ def main():
 
     # CPU
     print("Running CPU benchmarks...")
-    start_time = time.time()
+    t0 = time.time()
     cpu_s = benchmark_cpu_single()
-    cpu_s_time = time.time() - start_time
+    cpu_s_t = time.time() - t0
     
-    start_time = time.time()
+    t0 = time.time()
     cpu_m = benchmark_cpu_multi()
-    cpu_m_time = time.time() - start_time
+    cpu_m_t = time.time() - t0
     
     report(results, 'cpu_single_gflops', 'CPU single-thread GFLOPS', cpu_s, fmt='{:.1f}', unit='GFLOPS')
-    report(results, 'cpu_single_time', 'CPU single-thread runtime', cpu_s_time, fmt='{:.2f}', unit='seconds')
+    report(results, 'cpu_single_time', 'CPU single-thread runtime', cpu_s_t, fmt='{:.2f}', unit='sec')
     report(results, 'cpu_multi_gflops',  'CPU multi-thread GFLOPS',  cpu_m, fmt='{:.1f}', unit='GFLOPS')
-    report(results, 'cpu_multi_time', 'CPU multi-thread runtime', cpu_m_time, fmt='{:.2f}', unit='seconds')
+    report(results, 'cpu_multi_time', 'CPU multi-thread runtime', cpu_m_t, fmt='{:.2f}', unit='sec')
 
     # GPU
     print("Running GPU benchmarks...")
-    start_time = time.time()
+    t0 = time.time()
     gpu_s = benchmark_gpu_single()
-    gpu_s_time = time.time() - start_time
+    gpu_s_t = time.time() - t0
     
-    start_time = time.time()
+    t0 = time.time()
     gpu_m = benchmark_gpu_multi()
-    gpu_m_time = time.time() - start_time
+    gpu_m_t = time.time() - t0
     
     if HAS_CUDA:
         report(results, 'gpu_single_gflops', 'GPU single-stream GFLOPS', gpu_s, fmt='{:.1f}', skip_if_none=True, unit='GFLOPS')
-        report(results, 'gpu_single_time', 'GPU single-stream runtime', gpu_s_time, fmt='{:.2f}', unit='seconds')
+        report(results, 'gpu_single_time', 'GPU single-stream runtime', gpu_s_t, fmt='{:.2f}', unit='sec')
         report(results, 'gpu_multi_gflops',  'GPU multi-stream GFLOPS',  gpu_m, fmt='{:.1f}', skip_if_none=True, unit='GFLOPS')
-        report(results, 'gpu_multi_time', 'GPU multi-stream runtime', gpu_m_time, fmt='{:.2f}', unit='seconds')
+        report(results, 'gpu_multi_time', 'GPU multi-stream runtime', gpu_m_t, fmt='{:.2f}', unit='sec')
     else:
         print('GPU benchmarks skipped (no CUDA)')
         results['gpu_single_gflops'] = ''
@@ -281,33 +337,33 @@ def main():
 
     # RAM
     print("Running RAM benchmarks...")
-    start_time = time.time()
+    t0 = time.time()
     seq_w, seq_r = benchmark_ram_sequential()
-    ram_seq_time = time.time() - start_time
+    ram_seq_t = time.time() - t0
     
-    start_time = time.time()
+    t0 = time.time()
     rnd_w, rnd_r = benchmark_ram_random()
-    ram_rnd_time = time.time() - start_time
+    ram_rnd_t = time.time() - t0
     
     report(results, 'ram_seq_write', 'RAM sequential write', seq_w, fmt='{:.0f}', unit='MB/s')
     report(results, 'ram_seq_read',  'RAM sequential read',  seq_r, fmt='{:.0f}', unit='MB/s')
-    report(results, 'ram_seq_time', 'RAM sequential runtime', ram_seq_time, fmt='{:.2f}', unit='seconds')
+    report(results, 'ram_seq_time', 'RAM sequential runtime', ram_seq_t, fmt='{:.2f}', unit='sec')
     report(results, 'ram_rnd_write','RAM random write',     rnd_w, fmt='{:.0f}', unit='MB/s')
     report(results, 'ram_rnd_read', 'RAM random read',      rnd_r, fmt='{:.0f}', unit='MB/s')
-    report(results, 'ram_rnd_time', 'RAM random runtime', ram_rnd_time, fmt='{:.2f}', unit='seconds')
+    report(results, 'ram_rnd_time', 'RAM random runtime', ram_rnd_t, fmt='{:.2f}', unit='sec')
 
     # Disk
     print("Running Disk I/O benchmarks...")
-    start_time = time.time()
+    t0 = time.time()
     io_w, io_r = benchmark_disk_io()
-    disk_time = time.time() - start_time
+    disk_t = time.time() - t0
     
     report(results, 'disk_write', 'Disk write', io_w, fmt='{:.0f}', unit='MB/s')
     report(results, 'disk_read',  'Disk read',  io_r, fmt='{:.0f}', unit='MB/s')
-    report(results, 'disk_time', 'Disk I/O runtime', disk_time, fmt='{:.2f}', unit='seconds')
+    report(results, 'disk_time', 'Disk I/O runtime', disk_t, fmt='{:.2f}', unit='sec')
 
-    write_csv_row(results)
-    print(f"\nResults saved to {CSV_FILE}\n")
+    write_to_csv(results)
+    print(f"\nResults saved to {CSV_FILE!r}\n")
 
 
 if __name__ == '__main__':
