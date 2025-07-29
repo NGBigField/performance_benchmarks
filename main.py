@@ -78,7 +78,7 @@ def get_system_info():
     return info
 
 
-def benchmark_cpu_single(n=2000, iters=25):
+def benchmark_cpu_single(n=2000, iters=250):
     """Single‐threaded matrix‐multiply FLOPS."""
     # Ensure reproducible random matrices
     np.random.seed(RANDOM_SEED)
@@ -101,7 +101,7 @@ def _cpu_worker(n, iters, queue):
     queue.put(gflops)
 
 
-def benchmark_cpu_multi(n=2000, iters=5):
+def benchmark_cpu_multi(n=2000, iters=10):
     """Multi‐process CPU FLOPS across all logical cores."""
     procs = []
     queue = mp.Queue()
@@ -116,7 +116,7 @@ def benchmark_cpu_multi(n=2000, iters=5):
     return sum(queue.get() for _ in procs)
 
 
-def benchmark_gpu_single(n=4096, iters=20):
+def benchmark_gpu_single(n=4096, iters=200):
     """Single CUDA stream matrix FLOPS via PyTorch."""
     if not HAS_CUDA:
         return None
@@ -137,7 +137,7 @@ def benchmark_gpu_single(n=4096, iters=20):
     return total_flops / elapsed / 1e9  # GFLOPS
 
 
-def benchmark_gpu_multi(n=4096, iters=10, streams=4):
+def benchmark_gpu_multi(n=4096, iters=100, streams=4):
     """Multi‐stream GPU FLOPS."""
     if not HAS_CUDA:
         return None
@@ -161,19 +161,41 @@ def benchmark_gpu_multi(n=4096, iters=10, streams=4):
     return total_flops / elapsed / 1e9  # GFLOPS
 
 
-def benchmark_ram_sequential(size_mb=500):
-    """Sequential write + read bandwidth (MB/s)."""
+def benchmark_ram_sequential(size_mb=5_000, cycles=5):
+    """Sequential write + read bandwidth (MB/s), averaged over multiple cycles."""
     size = size_mb * 1024 * 1024 // 8
-    arr = np.empty(size, dtype=np.float64)
-    # write
-    start = time.time()
-    arr.fill(1.23)
-    write_time = time.time() - start
-    # read
-    start = time.time()
-    s = arr.sum()
-    read_time = time.time() - start
-    return size_mb / write_time, size_mb / read_time
+    
+    write_times = []
+    read_times = []
+    
+    for cycle in range(cycles):
+        # Create fresh array each cycle to avoid cache effects
+        arr = np.empty(size, dtype=np.float64)
+
+        random_float = float(np.random.rand())*10
+        
+        # write
+        start = time.time()
+        arr.fill(random_float)
+        write_times.append(time.time() - start)
+        
+        # read
+        start = time.time()
+        s = arr.sum()
+        read_times.append(time.time() - start)
+        
+        # Optional: force garbage collection between cycles
+        del arr
+    
+    # Calculate average bandwidth from all cycles
+    avg_write_time = sum(write_times) / len(write_times)
+    avg_read_time = sum(read_times) / len(read_times)
+    
+    # Give outputs a meaningful name with units:
+    write_bandwidth = size_mb / avg_write_time
+    read_bandwidth = size_mb / avg_read_time
+
+    return write_bandwidth, read_bandwidth
 
 
 def benchmark_ram_random(size_mb=500, accesses=100_000_000):
@@ -299,11 +321,12 @@ def main():
     for k, v in sys.items(): results[k] = v
 
     # CPU
-    print("Running CPU benchmarks...")
+    print("Running CPU benchmarks - single-thread...")
     t0 = time.time()
     cpu_s = benchmark_cpu_single()
     cpu_s_t = time.time() - t0
     
+    print("Running CPU benchmarks - multi-thread...")
     t0 = time.time()
     cpu_m = benchmark_cpu_multi()
     cpu_m_t = time.time() - t0
@@ -314,11 +337,12 @@ def main():
     report(results, 'cpu_multi_time', 'CPU multi-thread runtime', cpu_m_t, fmt='{:.2f}', unit='sec')
 
     # GPU
-    print("Running GPU benchmarks...")
+    print("Running GPU benchmarks - single-thread...")
     t0 = time.time()
     gpu_s = benchmark_gpu_single()
     gpu_s_t = time.time() - t0
     
+    print("Running GPU benchmarks - multi-thread...")
     t0 = time.time()
     gpu_m = benchmark_gpu_multi()
     gpu_m_t = time.time() - t0
