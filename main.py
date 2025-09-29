@@ -381,8 +381,8 @@ def main():
         results['gpu_multi_time'] = ''
 
     # RAM
-    ram_seq_t, seq_w, seq_r = _time_and_average(benchmark_ram_sequential, runs=6)
-    ram_rnd_t, rnd_w, rnd_r = _time_and_average(benchmark_ram_random, runs=6)
+    ram_seq_t, seq_w, seq_r = _time_and_average(benchmark_ram_sequential, runs=10)
+    ram_rnd_t, rnd_w, rnd_r = _time_and_average(benchmark_ram_random, runs=10)
     
     report(results, 'ram_seq_write', 'RAM sequential write', seq_w, fmt='{:.0f}', unit='MB/s')
     report(results, 'ram_seq_read',  'RAM sequential read',  seq_r, fmt='{:.0f}', unit='MB/s')
@@ -392,7 +392,7 @@ def main():
     report(results, 'ram_rnd_time', 'RAM random runtime', ram_rnd_t, fmt='{:.2f}', unit='sec')
 
     # Disk
-    disk_t, io_w, io_r = _time_and_average(benchmark_disk_io, runs=10)
+    disk_t, io_w, io_r = _time_and_average(benchmark_disk_io, runs=50)
     
     report(results, 'disk_write', 'Disk write', io_w, fmt='{:.0f}', unit='MB/s')
     report(results, 'disk_read',  'Disk read',  io_r, fmt='{:.0f}', unit='MB/s')
