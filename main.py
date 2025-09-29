@@ -23,6 +23,10 @@ import cpuinfo
 import GPUtil
 import torch
 
+from typing import ParamSpec, Callable, TypeAlias, TypeVar, Any
+
+from tqdm import tqdm
+
 # Set random seeds for reproducibility
 RANDOM_SEED = 42
 np.random.seed(RANDOM_SEED)
@@ -37,6 +41,39 @@ HAS_CUDA = torch.cuda.is_available()
 # CSV output configuration
 OUTPUT_DIR = "outputs"
 CSV_FILE = os.path.join(OUTPUT_DIR, "performance_benchmarks.csv")
+
+
+
+def _average(values:list[float]) -> float:
+    return sum(values) / len(values)
+
+
+def _time_and_average(func:Callable[[Any], float|None|tuple], runs:int=1) -> tuple[float, ...]:
+
+    desc = f"Running {func.__name__!r}"
+
+    t0 = time.time()
+    results = [
+        func() for _ in tqdm(range(runs), desc=desc, unit="run", leave=False)
+    ]
+    tf = time.time()
+    average_time = (tf - t0) / runs
+    
+    _dummy = results[0]
+    if isinstance(_dummy, tuple):
+        # multiple return values
+        averaged_results = [_average([r[i] for r in results]) for i in range(len(_dummy))]
+        return (average_time, *averaged_results)
+    
+    elif isinstance(_dummy, (int, float)):
+        average_results = _average(results)
+        return (average_time, average_results)
+    
+    elif _dummy is None:
+        return (average_time, None)
+    
+    else:
+        raise ValueError(f"Unsupported return type from function {func.__name__!r}")
 
 
 def get_system_info():
@@ -78,16 +115,20 @@ def get_system_info():
     return info
 
 
-def benchmark_cpu_single(n=2000, iters=250):
+def benchmark_cpu_single(n=2_000, iters=100, prog_bar:bool=True):
     """Single‐threaded matrix‐multiply FLOPS."""
-    # Ensure reproducible random matrices
-    np.random.seed(RANDOM_SEED)
     a = np.random.rand(n, n).astype(np.float64)
     b = np.random.rand(n, n).astype(np.float64)
     # warm
     _ = a.dot(b)
+
+    if prog_bar:
+        iterator = tqdm(range(iters), desc="  -> CPU single-threaded", unit="iter", leave=False)
+    else:
+        iterator = range(iters)
+    
     t0 = time.time()
-    for _ in range(iters):
+    for _ in iterator:
         a.dot(b)
     elapsed = time.time() - t0
     # flops ≈ 2 * n^3 per multiply
@@ -97,7 +138,7 @@ def benchmark_cpu_single(n=2000, iters=250):
 
 def _cpu_worker(n, iters, queue):
     """Helper for multi‐proc."""
-    gflops = benchmark_cpu_single(n, iters)
+    gflops = benchmark_cpu_single(n, iters, prog_bar=False)
     queue.put(gflops)
 
 
@@ -121,15 +162,13 @@ def benchmark_gpu_single(n=4096, iters=200):
     if not HAS_CUDA:
         return None
     torch.cuda.synchronize()
-    # Ensure reproducible random tensors
-    torch.manual_seed(RANDOM_SEED)
     a = torch.randn(n, n, device='cuda', dtype=torch.float32)
     b = torch.randn(n, n, device='cuda', dtype=torch.float32)
     # warm
     _ = a @ b
     torch.cuda.synchronize()
     t0 = time.time()
-    for _ in range(iters):
+    for _ in tqdm(range(iters), desc="  -> GPU single-threaded", unit="iter"):
         _ = a @ b
     torch.cuda.synchronize()
     elapsed = time.time() - t0
@@ -143,8 +182,6 @@ def benchmark_gpu_multi(n=4096, iters=100, streams=4):
         return None
     torch.cuda.synchronize()
     streams = [torch.cuda.Stream() for _ in range(streams)]
-    # Ensure reproducible random tensors
-    torch.manual_seed(RANDOM_SEED)
     a = torch.randn(n, n, device='cuda', dtype=torch.float32)
     b = torch.randn(n, n, device='cuda', dtype=torch.float32)
     # warm
@@ -202,8 +239,6 @@ def benchmark_ram_random(size_mb=500, accesses=100_000_000):
     """Random write + read bandwidth (MB/s)."""
     size = size_mb * 1024 * 1024 // 8
     arr = np.zeros(size, dtype=np.float64)
-    # Ensure reproducible random indices
-    np.random.seed(RANDOM_SEED)
     idx = np.random.randint(0, size, size=accesses)
     # write
     t0 = time.time()
@@ -321,15 +356,8 @@ def main():
     for k, v in sys.items(): results[k] = v
 
     # CPU
-    print("Running CPU benchmarks - single-thread...")
-    t0 = time.time()
-    cpu_s = benchmark_cpu_single()
-    cpu_s_t = time.time() - t0
-    
-    print("Running CPU benchmarks - multi-thread...")
-    t0 = time.time()
-    cpu_m = benchmark_cpu_multi()
-    cpu_m_t = time.time() - t0
+    cpu_s_t, cpu_s = _time_and_average(benchmark_cpu_single, runs=3)    
+    cpu_m_t, cpu_m = _time_and_average(benchmark_cpu_multi, runs=3)
     
     report(results, 'cpu_single_gflops', 'CPU single-thread GFLOPS', cpu_s, fmt='{:.1f}', unit='GFLOPS')
     report(results, 'cpu_single_time', 'CPU single-thread runtime', cpu_s_t, fmt='{:.2f}', unit='sec')
@@ -337,16 +365,9 @@ def main():
     report(results, 'cpu_multi_time', 'CPU multi-thread runtime', cpu_m_t, fmt='{:.2f}', unit='sec')
 
     # GPU
-    print("Running GPU benchmarks - single-thread...")
-    t0 = time.time()
-    gpu_s = benchmark_gpu_single()
-    gpu_s_t = time.time() - t0
-    
-    print("Running GPU benchmarks - multi-thread...")
-    t0 = time.time()
-    gpu_m = benchmark_gpu_multi()
-    gpu_m_t = time.time() - t0
-    
+    gpu_s_t, gpu_s = _time_and_average(benchmark_gpu_single, runs=5)    
+    gpu_m_t, gpu_m = _time_and_average(benchmark_gpu_multi, runs=5)
+
     if HAS_CUDA:
         report(results, 'gpu_single_gflops', 'GPU single-stream GFLOPS', gpu_s, fmt='{:.1f}', skip_if_none=True, unit='GFLOPS')
         report(results, 'gpu_single_time', 'GPU single-stream runtime', gpu_s_t, fmt='{:.2f}', unit='sec')
@@ -360,14 +381,8 @@ def main():
         results['gpu_multi_time'] = ''
 
     # RAM
-    print("Running RAM benchmarks...")
-    t0 = time.time()
-    seq_w, seq_r = benchmark_ram_sequential()
-    ram_seq_t = time.time() - t0
-    
-    t0 = time.time()
-    rnd_w, rnd_r = benchmark_ram_random()
-    ram_rnd_t = time.time() - t0
+    ram_seq_t, seq_w, seq_r = _time_and_average(benchmark_ram_sequential, runs=6)
+    ram_rnd_t, rnd_w, rnd_r = _time_and_average(benchmark_ram_random, runs=6)
     
     report(results, 'ram_seq_write', 'RAM sequential write', seq_w, fmt='{:.0f}', unit='MB/s')
     report(results, 'ram_seq_read',  'RAM sequential read',  seq_r, fmt='{:.0f}', unit='MB/s')
@@ -377,10 +392,7 @@ def main():
     report(results, 'ram_rnd_time', 'RAM random runtime', ram_rnd_t, fmt='{:.2f}', unit='sec')
 
     # Disk
-    print("Running Disk I/O benchmarks...")
-    t0 = time.time()
-    io_w, io_r = benchmark_disk_io()
-    disk_t = time.time() - t0
+    disk_t, io_w, io_r = _time_and_average(benchmark_disk_io, runs=10)
     
     report(results, 'disk_write', 'Disk write', io_w, fmt='{:.0f}', unit='MB/s')
     report(results, 'disk_read',  'Disk read',  io_r, fmt='{:.0f}', unit='MB/s')
